@@ -181,7 +181,7 @@ export const FileUpload: React.FC<FileUploadProps> = ({ onLogout }) => {
               Drag and drop files here, or click to select files
             </p>
             <p className="text-sm text-gray-500">
-              No size limit • All file types supported
+              Maximum 25GB per file • All file types supported
             </p>
             <input
               ref={fileInputRef}

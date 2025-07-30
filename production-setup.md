@@ -67,11 +67,12 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_cache_bypass $http_upgrade;
         
-        # Handle large file uploads
-        client_max_body_size 50G;
-        proxy_connect_timeout 600s;
-        proxy_send_timeout 600s;
-        proxy_read_timeout 600s;
+        # Handle large file uploads (25GB limit)
+        client_max_body_size 25G;
+        proxy_connect_timeout 1800s;      # 30 minutes
+        proxy_send_timeout 1800s;         # 30 minutes
+        proxy_read_timeout 1800s;         # 30 minutes
+        proxy_request_buffering off;      # Don't buffer large uploads
     }
 }
 ```

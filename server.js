@@ -7,6 +7,10 @@ const fs = require('fs');
 const app = express();
 const PORT = process.env.PORT || 3011;
 
+// Configure Express for large file uploads
+app.use(express.json({ limit: '25gb' }));
+app.use(express.urlencoded({ limit: '25gb', extended: true }));
+
 // Generate UUID without external dependency
 const generateUUID = () => {
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
@@ -44,8 +48,18 @@ const storage = multer.diskStorage({
 const upload = multer({ 
   storage: storage,
   limits: {
-    fileSize: 50 * 1024 * 1024 * 1024 // 50GB limit (effectively unlimited for most use cases)
+    fileSize: 25 * 1024 * 1024 * 1024 // 25GB limit as requested
   }
+});
+
+// Increase timeout for large file uploads
+app.use((req, res, next) => {
+  if (req.url === '/api/upload') {
+    // Set timeout to 30 minutes for uploads
+    req.setTimeout(30 * 60 * 1000);
+    res.setTimeout(30 * 60 * 1000);
+  }
+  next();
 });
 
 // File metadata storage (in production, use a database)
