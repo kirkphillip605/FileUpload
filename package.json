@@ -9,6 +9,7 @@
     "start": "concurrently \"npm run server\" \"npm run dev\"",
     "dev:full": "concurrently \"npm run server\" \"npm run dev\"",
     "build": "vite build",
+    "start:prod": "npm run build && node server.js",
     "lint": "eslint .",
     "preview": "vite preview"
   },
