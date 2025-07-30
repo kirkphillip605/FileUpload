@@ -213,7 +213,7 @@ export const FileUpload: React.FC<FileUploadProps> = ({ onLogout }) => {
           <div className="flex items-center justify-between">
             <div>
               <h1 className="text-2xl font-bold text-gray-900">Resumable File Upload</h1>
-              <p className="text-gray-600 mt-1">Upload large files with automatic resume capability</p>
+              <p className="text-gray-600 mt-1">Upload large files to local server storage with resume capability</p>
             </div>
             <button
               onClick={handleLogout}
@@ -267,7 +267,7 @@ export const FileUpload: React.FC<FileUploadProps> = ({ onLogout }) => {
               <p>• <strong>25GB maximum</strong> per file</p>
               <p>• <strong>Resumable uploads</strong> - continues if interrupted</p>
               <p>• <strong>All file types</strong> supported</p>
-              <p>• <strong>Cloud storage</strong> - files stored securely in MinIO</p>
+              <p>• <strong>Local storage</strong> - files stored securely on server</p>
             </div>
             <input
               ref={fileInputRef}
@@ -289,7 +289,7 @@ export const FileUpload: React.FC<FileUploadProps> = ({ onLogout }) => {
                   {successCount} file{successCount !== 1 ? 's' : ''} uploaded successfully!
                 </h3>
                 <p className="text-green-700">
-                  Your files have been securely stored in cloud storage.
+                  Your files have been securely stored on the server.
                 </p>
               </div>
             </div>
