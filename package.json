@@ -9,7 +9,7 @@
     "start": "concurrently \"npm run server\" \"npm run dev\"",
     "build": "vite build",
     "start:prod": "npm run build && node server.js",
-    "start:server": "NODE_ENV=production PORT=3020 node server.js",
+    "start:server": "NODE_ENV=production PORT=3010 node server.js",
     "lint": "eslint .",
     "preview": "vite preview"
   },

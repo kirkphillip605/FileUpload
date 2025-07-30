@@ -15,10 +15,9 @@ This creates a `dist/` folder with optimized production files.
 For a quick production start:
 
 ```bash
-PORT=3020 npm run start:prod
+PORT=3010 npm run start:prod
 ```
 
-This builds the app and starts the server on port 3020.
 
 ## 3. Production Deployment with PM2 (Recommended)
 
@@ -57,7 +56,7 @@ server {
     server_name files.kirknetllc.com;
     
     location / {
-        proxy_pass http://10.10.0.251:3020;
+        proxy_pass http://10.10.0.251:3010;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection 'upgrade';
@@ -113,7 +112,8 @@ export PORT=3010
 - Node.js 16+ installed
 - Sufficient disk space for file uploads
 - Proper firewall configuration for port 3010 (or 80/443 with Nginx)
- Proper firewall configuration for port 3020 (or 80/443 with Nginx)
+- Proper firewall configuration for port 3010 for API server
+- Proper firewall configuration for port 3020 for frontend (development)
 
 ## 9. Monitoring
 
