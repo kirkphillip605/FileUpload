@@ -2,7 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
-import { Server as TusServer } from 'tus-node-server';
+import { Server } from '@tus/server';
 import { FileStore } from '@tus/file-store';
 import { fileURLToPath } from 'url';
 
@@ -36,10 +36,9 @@ app.use(cors({
 }));
 
 // Configure TUS server for resumable uploads
-const tusServer = new TusServer({
-  path: '/api/upload',
+const tusServer = new Server({
   datastore: new FileStore({
-    directory: uploadsDir,
+    directory: uploadsDir
   }),
   namingFunction: (req) => {
     // Use custom naming function to preserve original filename
@@ -52,11 +51,11 @@ const tusServer = new TusServer({
     return generateUUID();
   },
   onUploadFinish: async (req, res, upload) => {
-    console.log('📤 Upload finished to local storage:', upload.id);
+    console.log('📤 Upload finished to local storage:', upload.id || 'unknown');
     
     try {
-      // File is already in the uploads directory, just need to save metadata
-      const filePath = path.join(uploadsDir, upload.id);
+      const uploadId = upload.id || upload.storage?.path || 'unknown';
+      const filePath = path.join(uploadsDir, uploadId);
       
       // Extract metadata
       const metadata = upload.metadata || {};
@@ -71,7 +70,7 @@ const tusServer = new TusServer({
       const fileMetadata = {
         id: fileId,
         originalName: originalName,
-        fileName: upload.id, // The actual filename on disk
+        fileName: uploadId, // The actual filename on disk
         size: stats.size,
         mimetype: fileType,
         uploadDate: new Date().toISOString(),
@@ -90,8 +89,7 @@ const tusServer = new TusServer({
     }
   },
   onUploadCreate: (req, res, upload) => {
-    console.log('🆕 Upload created:', upload.id);
-    return res;
+    console.log('🆕 Upload created:', upload.id || 'unknown');
   }
 });
 
@@ -146,14 +144,14 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 // Handle TUS resumable uploads
-app.all('/api/upload', (req, res) => {
+app.all('/api/upload', (req, res, next) => {
   console.log(`📡 TUS request: ${req.method} ${req.url}`);
-  tusServer.handle(req, res);
+  return tusServer.handle(req, res);
 });
 
-app.all('/api/upload/*', (req, res) => {
+app.all('/api/upload/*', (req, res, next) => {
   console.log(`📡 TUS request: ${req.method} ${req.url}`);
-  tusServer.handle(req, res);
+  return tusServer.handle(req, res);
 });
 
 // Get all files
