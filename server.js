@@ -2,9 +2,8 @@ import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
-import { Server } from '@tus/server';
-import { FileStore } from '@tus/file-store';
 import { fileURLToPath } from 'url';
+import formidable from 'formidable';
 
 // ES module __dirname equivalent
 const __filename = fileURLToPath(import.meta.url);
@@ -24,8 +23,14 @@ const generateUUID = () => {
 
 // Ensure required directories exist
 const uploadsDir = path.join(__dirname, 'uploads');
+const tempDir = path.join(__dirname, 'temp');
+
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+if (!fs.existsSync(tempDir)) {
+  fs.mkdirSync(tempDir, { recursive: true });
 }
 
 // Middleware
@@ -35,64 +40,8 @@ app.use(cors({
   exposedHeaders: ['Upload-Offset', 'Location', 'Upload-Length', 'Tus-Version', 'Tus-Resumable', 'Tus-Max-Size', 'Tus-Extension', 'Upload-Metadata']
 }));
 
-// Configure TUS server for resumable uploads
-const tusServer = new Server({
-  path: '/api/upload',
-  datastore: new FileStore({
-    directory: uploadsDir
-  }),
-  namingFunction: (req) => {
-    // Use custom naming function to preserve original filename
-    const metadata = req.headers['upload-metadata'];
-    if (metadata) {
-      const decoded = Buffer.from(metadata.split(' ')[1] || '', 'base64').toString();
-      const sanitizedName = decoded.replace(/[^a-zA-Z0-9.-]/g, '_');
-      return `${Date.now()}-${sanitizedName}`;
-    }
-    return generateUUID();
-  },
-  onUploadFinish: async (req, res, upload) => {
-    console.log('📤 Upload finished to local storage:', upload.id || 'unknown');
-    
-    try {
-      const uploadId = upload.id || upload.storage?.path || 'unknown';
-      const filePath = path.join(uploadsDir, uploadId);
-      
-      // Extract metadata
-      const metadata = upload.metadata || {};
-      const originalName = metadata.filename || 'unknown-file';
-      const fileType = metadata.filetype || 'application/octet-stream';
-      
-      // Get file size
-      const stats = fs.statSync(filePath);
-      
-      // Store file metadata
-      const fileId = generateUUID();
-      const fileMetadata = {
-        id: fileId,
-        originalName: originalName,
-        fileName: uploadId, // The actual filename on disk
-        size: stats.size,
-        mimetype: fileType,
-        uploadDate: new Date().toISOString(),
-        filePath: filePath
-      };
-      
-      // Save metadata
-      const metadataMap = loadMetadata();
-      metadataMap.set(fileId, fileMetadata);
-      saveMetadata(metadataMap);
-      
-      console.log('✅ File saved to local storage:', originalName);
-      
-    } catch (error) {
-      console.error('❌ Error processing completed upload:', error);
-    }
-  },
-  onUploadCreate: (req, res, upload) => {
-    console.log('🆕 Upload created:', upload.id || 'unknown');
-  }
-});
+app.use(express.json({ limit: '25gb' }));
+app.use(express.urlencoded({ extended: true, limit: '25gb' }));
 
 // File metadata storage
 let fileMetadata = new Map();
@@ -130,6 +79,9 @@ const saveMetadata = (metadataMap) => {
 // Load metadata on startup
 fileMetadata = loadMetadata();
 
+// Upload tracking for resumable uploads
+const uploads = new Map();
+
 // Serve built React app in production
 if (process.env.NODE_ENV === 'production') {
   const distPath = path.join(__dirname, 'dist');
@@ -144,21 +96,228 @@ if (process.env.NODE_ENV === 'production') {
   });
 }
 
-// Handle TUS resumable uploads
-app.all('/api/upload', (req, res, next) => {
-  console.log(`📡 TUS request: ${req.method} ${req.url}`);
-  return tusServer.handle(req, res);
+// TUS Protocol Headers for resumable uploads
+app.options('/api/upload', (req, res) => {
+  res.setHeader('Tus-Resumable', '1.0.0');
+  res.setHeader('Tus-Version', '1.0.0');
+  res.setHeader('Tus-Max-Size', '26843545600'); // 25GB
+  res.setHeader('Tus-Extension', 'creation,expiration');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, HEAD, PATCH, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Upload-Length, Upload-Metadata, Tus-Resumable, Upload-Offset, Content-Type');
+  res.status(200).end();
 });
 
-app.all('/api/upload/*', (req, res, next) => {
-  console.log(`📡 TUS request: ${req.method} ${req.url}`);
-  return tusServer.handle(req, res);
+// Create upload session (TUS creation)
+app.post('/api/upload', (req, res) => {
+  try {
+    const uploadLength = parseInt(req.headers['upload-length']);
+    const uploadMetadata = req.headers['upload-metadata'] || '';
+    
+    if (!uploadLength || uploadLength > 26843545600) { // 25GB limit
+      return res.status(413).json({ error: 'File too large. Maximum size is 25GB.' });
+    }
+
+    const uploadId = generateUUID();
+    const tempFilePath = path.join(tempDir, uploadId);
+    
+    // Parse metadata
+    let filename = 'unknown';
+    let filetype = 'application/octet-stream';
+    
+    if (uploadMetadata) {
+      const metadata = uploadMetadata.split(',').map(item => {
+        const [key, value] = item.trim().split(' ');
+        return { key, value: Buffer.from(value || '', 'base64').toString() };
+      });
+      
+      const filenameItem = metadata.find(m => m.key === 'filename');
+      if (filenameItem) filename = filenameItem.value;
+      
+      const filetypeItem = metadata.find(m => m.key === 'filetype');
+      if (filetypeItem) filetype = filetypeItem.value;
+    }
+
+    // Create empty temporary file
+    fs.writeFileSync(tempFilePath, '');
+
+    // Store upload session
+    uploads.set(uploadId, {
+      id: uploadId,
+      length: uploadLength,
+      offset: 0,
+      filename,
+      filetype,
+      tempPath: tempFilePath,
+      created: new Date().toISOString()
+    });
+
+    console.log(`🆕 Upload session created: ${filename} (${uploadLength} bytes)`);
+
+    res.setHeader('Tus-Resumable', '1.0.0');
+    res.setHeader('Location', `/api/upload/${uploadId}`);
+    res.status(201).end();
+  } catch (error) {
+    console.error('❌ Create upload error:', error);
+    res.status(500).json({ error: 'Failed to create upload session' });
+  }
+});
+
+// Get upload offset (TUS head)
+app.head('/api/upload/:id', (req, res) => {
+  try {
+    const uploadId = req.params.id;
+    const upload = uploads.get(uploadId);
+
+    if (!upload) {
+      return res.status(404).end();
+    }
+
+    res.setHeader('Tus-Resumable', '1.0.0');
+    res.setHeader('Upload-Offset', upload.offset.toString());
+    res.setHeader('Upload-Length', upload.length.toString());
+    res.status(200).end();
+  } catch (error) {
+    console.error('❌ Head upload error:', error);
+    res.status(500).end();
+  }
+});
+
+// Resume/continue upload (TUS patch)
+app.patch('/api/upload/:id', (req, res) => {
+  try {
+    const uploadId = req.params.id;
+    const upload = uploads.get(uploadId);
+
+    if (!upload) {
+      return res.status(404).json({ error: 'Upload session not found' });
+    }
+
+    const uploadOffset = parseInt(req.headers['upload-offset']);
+    
+    if (uploadOffset !== upload.offset) {
+      return res.status(409).json({ error: 'Offset mismatch' });
+    }
+
+    // Write chunk to temporary file
+    const writeStream = fs.createWriteStream(upload.tempPath, { 
+      flags: 'r+', 
+      start: uploadOffset 
+    });
+
+    let bytesWritten = 0;
+
+    req.on('data', (chunk) => {
+      writeStream.write(chunk);
+      bytesWritten += chunk.length;
+    });
+
+    req.on('end', async () => {
+      writeStream.end();
+      
+      // Update upload progress
+      upload.offset += bytesWritten;
+      uploads.set(uploadId, upload);
+
+      console.log(`📊 Upload progress: ${upload.filename} - ${upload.offset}/${upload.length} bytes (${Math.round((upload.offset/upload.length)*100)}%)`);
+
+      // Check if upload is complete
+      if (upload.offset >= upload.length) {
+        try {
+          // Move file to final destination
+          const finalPath = path.join(uploadsDir, `${Date.now()}-${upload.filename}`);
+          fs.renameSync(upload.tempPath, finalPath);
+
+          // Save file metadata
+          const fileId = generateUUID();
+          const fileMetadataEntry = {
+            id: fileId,
+            originalName: upload.filename,
+            fileName: path.basename(finalPath),
+            size: upload.length,
+            mimetype: upload.filetype,
+            uploadDate: new Date().toISOString(),
+            filePath: finalPath
+          };
+
+          fileMetadata.set(fileId, fileMetadataEntry);
+          saveMetadata(fileMetadata);
+
+          // Cleanup upload session
+          uploads.delete(uploadId);
+
+          console.log(`✅ Upload completed: ${upload.filename}`);
+        } catch (error) {
+          console.error('❌ Error finalizing upload:', error);
+        }
+      }
+
+      res.setHeader('Tus-Resumable', '1.0.0');
+      res.setHeader('Upload-Offset', upload.offset.toString());
+      res.status(204).end();
+    });
+
+    req.on('error', (error) => {
+      console.error('❌ Upload stream error:', error);
+      writeStream.destroy();
+      res.status(500).json({ error: 'Upload failed' });
+    });
+
+  } catch (error) {
+    console.error('❌ Patch upload error:', error);
+    res.status(500).json({ error: 'Upload failed' });
+  }
+});
+
+// Simple upload endpoint (fallback)
+app.post('/api/upload/simple', (req, res) => {
+  const form = formidable({
+    uploadDir: uploadsDir,
+    keepExtensions: true,
+    maxFileSize: 26843545600, // 25GB
+    filename: (name, ext, part) => {
+      return `${Date.now()}-${part.originalFilename}`;
+    }
+  });
+
+  form.parse(req, (err, fields, files) => {
+    if (err) {
+      console.error('❌ Simple upload error:', err);
+      return res.status(500).json({ error: 'Upload failed' });
+    }
+
+    try {
+      const file = Array.isArray(files.file) ? files.file[0] : files.file;
+      if (!file) {
+        return res.status(400).json({ error: 'No file uploaded' });
+      }
+
+      // Save file metadata
+      const fileId = generateUUID();
+      const fileMetadataEntry = {
+        id: fileId,
+        originalName: file.originalFilename || 'unknown',
+        fileName: path.basename(file.filepath),
+        size: file.size,
+        mimetype: file.mimetype || 'application/octet-stream',
+        uploadDate: new Date().toISOString(),
+        filePath: file.filepath
+      };
+
+      fileMetadata.set(fileId, fileMetadataEntry);
+      saveMetadata(fileMetadata);
+
+      console.log(`✅ Simple upload completed: ${file.originalFilename}`);
+      res.json({ success: true, fileId, filename: file.originalFilename });
+    } catch (error) {
+      console.error('❌ Error processing simple upload:', error);
+      res.status(500).json({ error: 'Failed to process upload' });
+    }
+  });
 });
 
 // Get all files
 app.get('/api/files', async (req, res) => {
   try {
-    // Get files from local metadata
     const files = Array.from(fileMetadata.values()).map(file => ({
       id: file.id,
       name: file.originalName,
@@ -186,7 +345,7 @@ app.get('/api/download/:fileId', async (req, res) => {
       return res.status(404).json({ error: 'File not found' });
     }
 
-    const filePath = path.join(uploadsDir, metadata.fileName);
+    const filePath = metadata.filePath;
     
     // Check if file exists on disk
     if (!fs.existsSync(filePath)) {
@@ -222,7 +381,7 @@ app.delete('/api/files/:fileId', async (req, res) => {
       return res.status(404).json({ error: 'File not found' });
     }
 
-    const filePath = path.join(uploadsDir, metadata.fileName);
+    const filePath = metadata.filePath;
     
     console.log('🗑️ Deleting file from local storage:', metadata.originalName);
 
@@ -257,9 +416,10 @@ app.get('/api/health', async (req, res) => {
       status: 'ok', 
       message: 'File upload server is running',
       filesCount: fileMetadata.size,
+      activeUploads: uploads.size,
       storage: 'Local File System',
       uploadsDirectory: uploadsDir,
-      resumableUploads: 'TUS Protocol Enabled'
+      resumableUploads: 'Custom TUS Implementation'
     });
   } catch (error) {
     console.error('❌ Health check failed:', error);
@@ -281,7 +441,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ File upload server running on port ${PORT}`);
   console.log(`📁 Local uploads directory: ${uploadsDir}`);
   console.log(`📊 Loaded ${fileMetadata.size} existing files`);
-  console.log(`🔄 Resumable uploads enabled (TUS protocol)`);
+  console.log(`🔄 Custom resumable uploads enabled`);
   console.log(`🏥 Health check: http://localhost:${PORT}/api/health`);
 });
 
@@ -303,3 +463,25 @@ process.on('SIGTERM', () => {
     process.exit(0);
   });
 });
+
+// Cleanup temporary files on startup
+const cleanupTempFiles = () => {
+  try {
+    const tempFiles = fs.readdirSync(tempDir);
+    tempFiles.forEach(file => {
+      const filePath = path.join(tempDir, file);
+      const stats = fs.statSync(filePath);
+      const ageHours = (Date.now() - stats.mtime.getTime()) / (1000 * 60 * 60);
+      
+      // Delete temp files older than 24 hours
+      if (ageHours > 24) {
+        fs.unlinkSync(filePath);
+        console.log(`🧹 Cleaned up old temp file: ${file}`);
+      }
+    });
+  } catch (error) {
+    console.error('❌ Error cleaning temp files:', error);
+  }
+};
+
+cleanupTempFiles();
