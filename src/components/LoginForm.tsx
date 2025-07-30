@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { Lock, Eye, EyeOff } from 'lucide-react';
 
 interface LoginFormProps {
-  onLogin: () => void;
+  onLogin: (role: 'uploader' | 'admin') => void;
 }
 
 export const LoginForm: React.FC<LoginFormProps> = ({ onLogin }) => {
@@ -20,8 +20,11 @@ export const LoginForm: React.FC<LoginFormProps> = ({ onLogin }) => {
     await new Promise(resolve => setTimeout(resolve, 500));
 
     if (password === 'fireworks') {
-      localStorage.setItem('fileUploadAuth', 'true');
-      onLogin();
+      localStorage.setItem('fileUploadAuth', 'uploader');
+      onLogin('uploader');
+    } else if (password === '!Jameson5475!') {
+      localStorage.setItem('fileUploadAuth', 'admin');
+      onLogin('admin');
     } else {
       setError('Invalid password. Please try again.');
       setPassword('');
@@ -38,7 +41,7 @@ export const LoginForm: React.FC<LoginFormProps> = ({ onLogin }) => {
               <Lock className="w-8 h-8 text-blue-600" />
             </div>
             <h1 className="text-2xl font-bold text-gray-900 mb-2">Secure File Upload</h1>
-            <p className="text-gray-600">Enter the password to access the upload area</p>
+            <p className="text-gray-600">Enter the password to access the system</p>
           </div>
 
           <form onSubmit={handleSubmit} className="space-y-6">
@@ -83,6 +86,12 @@ export const LoginForm: React.FC<LoginFormProps> = ({ onLogin }) => {
                 'Access Upload Area'
               )}
             </button>
+            
+            <div className="mt-4 text-center">
+              <p className="text-xs text-gray-500">
+                Use "fireworks" for uploads or admin password for file management
+              </p>
+            </div>
           </form>
         </div>
       </div>

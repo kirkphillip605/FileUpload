@@ -28,6 +28,9 @@ export const FileUpload: React.FC<FileUploadProps> = ({ onLogout }) => {
 
   const simulateUpload = (file: File): Promise<void> => {
     return new Promise((resolve) => {
+      // In a real implementation, this would send the file to your backend
+      // Example: POST to /api/upload with FormData containing the file
+      
       const fileId = Date.now().toString() + Math.random().toString(36).substr(2, 9);
       const newFile: UploadedFile = {
         id: fileId,

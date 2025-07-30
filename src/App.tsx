@@ -1,26 +1,29 @@
 import React, { useState, useEffect } from 'react';
 import { LoginForm } from './components/LoginForm';
 import { FileUpload } from './components/FileUpload';
+import { FileManager } from './components/FileManager';
+
+type UserRole = 'uploader' | 'admin' | null;
 
 function App() {
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [userRole, setUserRole] = useState<UserRole>(null);
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
     // Check if user is already authenticated
     const authStatus = localStorage.getItem('fileUploadAuth');
-    if (authStatus === 'true') {
-      setIsAuthenticated(true);
+    if (authStatus === 'uploader' || authStatus === 'admin') {
+      setUserRole(authStatus as UserRole);
     }
     setIsLoading(false);
   }, []);
 
-  const handleLogin = () => {
-    setIsAuthenticated(true);
+  const handleLogin = (role: UserRole) => {
+    setUserRole(role);
   };
 
   const handleLogout = () => {
-    setIsAuthenticated(false);
+    setUserRole(null);
   };
 
   if (isLoading) {
@@ -33,8 +36,10 @@ function App() {
 
   return (
     <>
-      {isAuthenticated ? (
+      {userRole === 'uploader' ? (
         <FileUpload onLogout={handleLogout} />
+      ) : userRole === 'admin' ? (
+        <FileManager onLogout={handleLogout} />
       ) : (
         <LoginForm onLogin={handleLogin} />
       )}
