@@ -37,6 +37,7 @@ app.use(cors({
 
 // Configure TUS server for resumable uploads
 const tusServer = new Server({
+  path: '/api/upload',
   datastore: new FileStore({
     directory: uploadsDir
   }),
