@@ -15,7 +15,7 @@ import { pipeline } from 'stream/promises';
 // Constants
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const PORT = process.env.PORT || 3010;
+const PORT = process.env.PORT || 3011;
 const MAX_FILE_SIZE = 25 * 1024 * 1024 * 1024; // 25GB
 const TUS_VERSION = '1.0.0';
 const METADATA_FILE = path.join(__dirname, 'file-metadata.json');
