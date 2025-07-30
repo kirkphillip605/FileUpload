@@ -24,39 +24,16 @@ export const FileManager: React.FC<FileManagerProps> = ({ onLogout }) => {
   useEffect(() => {
     const loadFiles = async () => {
       setIsLoading(true);
-      // Simulate API call to backend to list files
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      
-      // Mock data - in real implementation, this would come from your backend
-      const mockFiles: StoredFile[] = [
-        {
-          id: '1',
-          name: 'document.pdf',
-          size: 2458112,
-          uploadDate: '2024-01-15T10:30:00Z',
-          type: 'application/pdf',
-          path: '/uploads/document.pdf'
-        },
-        {
-          id: '2',
-          name: 'presentation.pptx',
-          size: 15728640,
-          uploadDate: '2024-01-14T14:22:00Z',
-          type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-          path: '/uploads/presentation.pptx'
-        },
-        {
-          id: '3',
-          name: 'image.jpg',
-          size: 3145728,
-          uploadDate: '2024-01-13T09:15:00Z',
-          type: 'image/jpeg',
-          path: '/uploads/image.jpg'
-        }
-      ];
-      
-      setFiles(mockFiles);
-      setIsLoading(false);
+      try {
+        const response = await fetch('/api/files');
+        const data = await response.json();
+        setFiles(data);
+      } catch (error) {
+        console.error('Error loading files:', error);
+        setFiles([]);
+      } finally {
+        setIsLoading(false);
+      }
     };
 
     loadFiles();
@@ -99,20 +76,36 @@ export const FileManager: React.FC<FileManagerProps> = ({ onLogout }) => {
   const totalSize = files.reduce((acc, file) => acc + file.size, 0);
 
   const handleDownload = (file: StoredFile) => {
-    // In real implementation, this would create a download link to your backend
-    console.log(`Downloading file: ${file.path}`);
-    // For now, we'll just show an alert
-    alert(`Download would start for: ${file.name}\nPath: ${file.path}`);
+    // Create a temporary link to trigger download
+    const link = document.createElement('a');
+    link.href = file.path;
+    link.download = file.name;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
   };
 
-  const handleDelete = (fileId: string) => {
+  const handleDelete = async (fileId: string) => {
     if (confirm('Are you sure you want to delete this file?')) {
-      setFiles(prev => prev.filter(f => f.id !== fileId));
-      setSelectedFiles(prev => {
-        const newSet = new Set(prev);
-        newSet.delete(fileId);
-        return newSet;
-      });
+      try {
+        const response = await fetch(`/api/files/${fileId}`, {
+          method: 'DELETE'
+        });
+        
+        if (response.ok) {
+          setFiles(prev => prev.filter(f => f.id !== fileId));
+          setSelectedFiles(prev => {
+            const newSet = new Set(prev);
+            newSet.delete(fileId);
+            return newSet;
+          });
+        } else {
+          alert('Failed to delete file');
+        }
+      } catch (error) {
+        console.error('Delete error:', error);
+        alert('Failed to delete file');
+      }
     }
   };
 
@@ -133,12 +126,23 @@ export const FileManager: React.FC<FileManagerProps> = ({ onLogout }) => {
     });
   };
 
-  const handleBulkDelete = () => {
+  const handleBulkDelete = async () => {
     if (selectedFiles.size === 0) return;
     
     if (confirm(`Are you sure you want to delete ${selectedFiles.size} selected file(s)?`)) {
-      setFiles(prev => prev.filter(f => !selectedFiles.has(f.id)));
-      setSelectedFiles(new Set());
+      try {
+        const deletePromises = Array.from(selectedFiles).map(fileId => 
+          fetch(`/api/files/${fileId}`, { method: 'DELETE' })
+        );
+        
+        await Promise.all(deletePromises);
+        
+        setFiles(prev => prev.filter(f => !selectedFiles.has(f.id)));
+        setSelectedFiles(new Set());
+      } catch (error) {
+        console.error('Bulk delete error:', error);
+        alert('Failed to delete some files');
+      }
     }
   };
 

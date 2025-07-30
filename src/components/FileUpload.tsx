@@ -28,9 +28,6 @@ export const FileUpload: React.FC<FileUploadProps> = ({ onLogout }) => {
 
   const simulateUpload = (file: File): Promise<void> => {
     return new Promise((resolve) => {
-      // In a real implementation, this would send the file to your backend
-      // Example: POST to /api/upload with FormData containing the file
-      
       const fileId = Date.now().toString() + Math.random().toString(36).substr(2, 9);
       const newFile: UploadedFile = {
         id: fileId,
@@ -42,30 +39,52 @@ export const FileUpload: React.FC<FileUploadProps> = ({ onLogout }) => {
 
       setUploadedFiles(prev => [...prev, newFile]);
 
-      // Simulate upload progress
-      const interval = setInterval(() => {
+      // Create FormData for file upload
+      const formData = new FormData();
+      formData.append('file', file);
+
+      // Upload to backend
+      fetch('/api/upload', {
+        method: 'POST',
+        body: formData,
+      })
+      .then(response => response.json())
+      .then(data => {
+        if (data.success) {
+          setUploadedFiles(prev => 
+            prev.map(f => 
+              f.id === fileId ? { ...f, status: 'success', progress: 100 } : f
+            )
+          );
+          resolve();
+        } else {
+          throw new Error(data.error || 'Upload failed');
+        }
+      })
+      .catch(error => {
+        console.error('Upload error:', error);
+        setUploadedFiles(prev => 
+          prev.map(f => 
+            f.id === fileId ? { ...f, status: 'error', progress: 0 } : f
+          )
+        );
+        resolve();
+      });
+
+      // Simulate progress for better UX
+      const progressInterval = setInterval(() => {
         setUploadedFiles(prev => 
           prev.map(f => {
-            if (f.id === fileId && f.progress < 100) {
-              const newProgress = Math.min(f.progress + Math.random() * 30, 100);
-              if (newProgress === 100) {
-                clearInterval(interval);
-                setTimeout(() => {
-                  setUploadedFiles(prev => 
-                    prev.map(file => 
-                      file.id === fileId ? { ...file, status: 'success' } : file
-                    )
-                  );
-                  resolve();
-                }, 300);
-                return { ...f, progress: newProgress };
-              }
-              return { ...f, progress: newProgress };
+            if (f.id === fileId && f.status === 'uploading' && f.progress < 90) {
+              return { ...f, progress: Math.min(f.progress + Math.random() * 15, 90) };
             }
             return f;
           })
         );
-      }, 100);
+      }, 200);
+
+      // Clear progress interval after 10 seconds
+      setTimeout(() => clearInterval(progressInterval), 10000);
     });
   };
 
