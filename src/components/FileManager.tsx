@@ -20,7 +20,7 @@ export const FileManager: React.FC<FileManagerProps> = ({ onLogout }) => {
   const [isLoading, setIsLoading] = useState(true);
   const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
 
-  // Simulate loading files from disk
+  // Load files from MinIO storage via API
   useEffect(() => {
     const loadFiles = async () => {
       setIsLoading(true);
@@ -29,7 +29,7 @@ export const FileManager: React.FC<FileManagerProps> = ({ onLogout }) => {
         const data = await response.json();
         setFiles(data);
       } catch (error) {
-        console.error('Error loading files:', error);
+        console.error('❌ Error loading files:', error);
         setFiles([]);
       } finally {
         setIsLoading(false);
@@ -168,8 +168,8 @@ export const FileManager: React.FC<FileManagerProps> = ({ onLogout }) => {
                 <Folder className="w-8 h-8 text-blue-600" />
               </div>
               <div>
-                <h1 className="text-2xl font-bold text-gray-900">File Manager</h1>
-                <p className="text-gray-600">Manage uploaded files</p>
+                <h1 className="text-2xl font-bold text-gray-900">Cloud File Manager</h1>
+                <p className="text-gray-600">Manage files stored in MinIO cloud storage</p>
               </div>
             </div>
             <button
@@ -202,7 +202,7 @@ export const FileManager: React.FC<FileManagerProps> = ({ onLogout }) => {
               </div>
               <div>
                 <p className="text-2xl font-bold text-gray-900">{formatFileSize(totalSize)}</p>
-                <p className="text-gray-600">Total Size</p>
+                <p className="text-gray-600">Cloud Storage Used</p>
               </div>
             </div>
           </div>
@@ -251,7 +251,7 @@ export const FileManager: React.FC<FileManagerProps> = ({ onLogout }) => {
               <File className="w-16 h-16 text-gray-300 mx-auto mb-4" />
               <h3 className="text-lg font-semibold text-gray-900 mb-2">No files found</h3>
               <p className="text-gray-600">
-                {searchTerm ? 'Try adjusting your search terms' : 'No files have been uploaded yet'}
+                {searchTerm ? 'Try adjusting your search terms' : 'No files have been uploaded to cloud storage yet'}
               </p>
             </div>
           ) : (

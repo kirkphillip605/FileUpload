@@ -1,15 +1,14 @@
 const express = require('express');
-const multer = require('multer');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
+const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, ListObjectsV2Command } = require('@aws-sdk/client-s3');
+const { Server: TusServer } = require('tus-node-server');
+const { FileStore } = require('@tus/file-store');
+const formidable = require('formidable');
 
 const app = express();
-const PORT = process.env.PORT || 3011;
-
-// Configure Express for large file uploads
-app.use(express.json({ limit: '25gb' }));
-app.use(express.urlencoded({ limit: '25gb', extended: true }));
+const PORT = process.env.PORT || 3010;
 
 // Generate UUID without external dependency
 const generateUUID = () => {
@@ -20,122 +19,183 @@ const generateUUID = () => {
   });
 };
 
-// Ensure uploads directory exists
+// Configure MinIO S3 client
+const s3Client = new S3Client({
+  endpoint: 'http://vps.kirknetllc.com:9000',
+  region: 'us-east-1', // MinIO doesn't care about region, but AWS SDK requires it
+  credentials: {
+    accessKeyId: '163f0c3c496d54dcf53d98db5d6fb74acc2689e86736ae527ac4c496a85b458d',
+    secretAccessKey: '3dabb8326f1941cf156185080e23280e27dc9c366d668f257d1ceaffe3651adc'
+  },
+  forcePathStyle: true // Required for MinIO
+});
+
+const BUCKET_NAME = 'kirknet-bucket';
+
+// Ensure required directories exist
 const uploadsDir = path.join(__dirname, 'uploads');
+const tempDir = path.join(__dirname, 'temp-uploads');
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
+if (!fs.existsSync(tempDir)) {
+  fs.mkdirSync(tempDir, { recursive: true });
+}
 
 // Middleware
-app.use(cors());
-app.use(express.json());
-app.use('/uploads', express.static(uploadsDir));
+app.use(cors({
+  origin: true,
+  credentials: true,
+  exposedHeaders: ['Upload-Offset', 'Location', 'Upload-Length', 'Tus-Version', 'Tus-Resumable', 'Tus-Max-Size', 'Tus-Extension', 'Upload-Metadata']
+}));
 
-// Configure multer for file uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, uploadsDir);
+// Configure TUS server for resumable uploads
+const tusServer = new TusServer({
+  path: '/api/upload',
+  datastore: new FileStore({
+    directory: tempDir,
+  }),
+  namingFunction: (req) => {
+    // Use custom naming function to preserve original filename
+    const metadata = req.headers['upload-metadata'];
+    if (metadata) {
+      const decoded = Buffer.from(metadata.split(' ')[1] || '', 'base64').toString();
+      return `${Date.now()}-${decoded}`;
+    }
+    return generateUUID();
   },
-  filename: (req, file, cb) => {
-    // Generate unique filename while preserving extension
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    const ext = path.extname(file.originalname);
-    const name = path.basename(file.originalname, ext);
-    cb(null, `${name}-${uniqueSuffix}${ext}`);
+  onUploadFinish: async (req, res, upload) => {
+    console.log('📤 Upload finished:', upload.id);
+    
+    try {
+      // Read the completed file from temp storage
+      const tempFilePath = path.join(tempDir, upload.id);
+      const fileStream = fs.createReadStream(tempFilePath);
+      
+      // Extract metadata
+      const metadata = upload.metadata || {};
+      const originalName = metadata.filename || 'unknown-file';
+      const fileType = metadata.filetype || 'application/octet-stream';
+      
+      // Generate S3 key
+      const s3Key = `uploads/${Date.now()}-${originalName}`;
+      
+      // Upload to MinIO/S3
+      const uploadCommand = new PutObjectCommand({
+        Bucket: BUCKET_NAME,
+        Key: s3Key,
+        Body: fileStream,
+        ContentType: fileType,
+        Metadata: {
+          originalName: originalName,
+          uploadDate: new Date().toISOString(),
+          uploadId: upload.id
+        }
+      });
+      
+      await s3Client.send(uploadCommand);
+      console.log('✅ File uploaded to MinIO:', s3Key);
+      
+      // Store file metadata
+      const fileId = generateUUID();
+      const fileMetadata = {
+        id: fileId,
+        originalName: originalName,
+        s3Key: s3Key,
+        size: upload.size,
+        mimetype: fileType,
+        uploadDate: new Date().toISOString(),
+        bucket: BUCKET_NAME
+      };
+      
+      // Save metadata to local storage
+      const metadataMap = loadMetadata();
+      metadataMap.set(fileId, fileMetadata);
+      saveMetadata(metadataMap);
+      
+      // Clean up temp file
+      try {
+        fs.unlinkSync(tempFilePath);
+        console.log('🧹 Cleaned up temp file:', tempFilePath);
+      } catch (cleanupError) {
+        console.warn('⚠️ Could not clean up temp file:', cleanupError.message);
+      }
+      
+    } catch (error) {
+      console.error('❌ Error processing completed upload:', error);
+    }
+  },
+  onUploadCreate: (req, res, upload) => {
+    console.log('🆕 Upload created:', upload.id);
+    return res;
   }
 });
 
-const upload = multer({ 
-  storage: storage,
-  limits: {
-    fileSize: 25 * 1024 * 1024 * 1024 // 25GB limit as requested
-  }
-});
-
-// Increase timeout for large file uploads
-app.use((req, res, next) => {
-  if (req.url === '/api/upload') {
-    // Set timeout to 30 minutes for uploads
-    req.setTimeout(30 * 60 * 1000);
-    res.setTimeout(30 * 60 * 1000);
-  }
-  next();
-});
-
-// File metadata storage (in production, use a database)
-const fileMetadata = new Map();
+// File metadata storage
+let fileMetadata = new Map();
 
 // Load existing file metadata on startup
 const metadataFile = path.join(__dirname, 'file-metadata.json');
-if (fs.existsSync(metadataFile)) {
-  try {
-    const data = fs.readFileSync(metadataFile, 'utf8');
-    const metadata = JSON.parse(data);
-    Object.entries(metadata).forEach(([key, value]) => {
-      fileMetadata.set(key, value);
-    });
-    console.log(`Loaded metadata for ${fileMetadata.size} files`);
-  } catch (error) {
-    console.error('Error loading file metadata:', error);
-  }
-}
 
-// Save metadata to file
-const saveMetadata = () => {
+const loadMetadata = () => {
+  if (fs.existsSync(metadataFile)) {
+    try {
+      const data = fs.readFileSync(metadataFile, 'utf8');
+      const metadata = JSON.parse(data);
+      const metadataMap = new Map();
+      Object.entries(metadata).forEach(([key, value]) => {
+        metadataMap.set(key, value);
+      });
+      return metadataMap;
+    } catch (error) {
+      console.error('Error loading file metadata:', error);
+      return new Map();
+    }
+  }
+  return new Map();
+};
+
+const saveMetadata = (metadataMap) => {
   try {
-    const metadata = Object.fromEntries(fileMetadata);
+    const metadata = Object.fromEntries(metadataMap);
     fs.writeFileSync(metadataFile, JSON.stringify(metadata, null, 2));
   } catch (error) {
     console.error('Error saving file metadata:', error);
   }
 };
 
-// API Routes
+// Load metadata on startup
+fileMetadata = loadMetadata();
 
-// Upload file
-app.post('/api/upload', upload.single('file'), (req, res) => {
-  console.log('📤 Upload request received');
+// Serve built React app in production
+if (process.env.NODE_ENV === 'production') {
+  const distPath = path.join(__dirname, 'dist');
+  app.use(express.static(distPath));
   
-  try {
-    if (!req.file) {
-      console.log('❌ No file in request');
-      return res.status(400).json({ error: 'No file uploaded' });
+  // Serve index.html for all non-API routes
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api/') || req.path.startsWith('/uploads/')) {
+      return next();
     }
+    res.sendFile(path.join(distPath, 'index.html'));
+  });
+}
 
-    const fileId = generateUUID();
-    const metadata = {
-      id: fileId,
-      originalName: req.file.originalname,
-      filename: req.file.filename,
-      size: req.file.size,
-      mimetype: req.file.mimetype,
-      uploadDate: new Date().toISOString(),
-      path: req.file.path
-    };
+// Handle TUS resumable uploads
+app.all('/api/upload', (req, res) => {
+  console.log(`📡 TUS request: ${req.method} ${req.url}`);
+  tusServer.handle(req, res);
+});
 
-    fileMetadata.set(fileId, metadata);
-    saveMetadata();
-
-    console.log(`✅ File uploaded: ${req.file.originalname} (${req.file.size} bytes)`);
-
-    res.json({
-      success: true,
-      file: {
-        id: fileId,
-        name: req.file.originalname,
-        size: req.file.size,
-        type: req.file.mimetype
-      }
-    });
-  } catch (error) {
-    console.error('❌ Upload error:', error);
-    res.status(500).json({ error: 'Upload failed' });
-  }
+app.all('/api/upload/*', (req, res) => {
+  console.log(`📡 TUS request: ${req.method} ${req.url}`);
+  tusServer.handle(req, res);
 });
 
 // Get all files
-app.get('/api/files', (req, res) => {
+app.get('/api/files', async (req, res) => {
   try {
+    // Get files from local metadata (which includes S3 references)
     const files = Array.from(fileMetadata.values()).map(file => ({
       id: file.id,
       name: file.originalName,
@@ -145,15 +205,16 @@ app.get('/api/files', (req, res) => {
       path: `/api/download/${file.id}`
     }));
 
+    console.log(`📋 Serving ${files.length} files from metadata`);
     res.json(files);
   } catch (error) {
-    console.error('Error fetching files:', error);
+    console.error('❌ Error fetching files:', error);
     res.status(500).json({ error: 'Failed to fetch files' });
   }
 });
 
-// Download file
-app.get('/api/download/:fileId', (req, res) => {
+// Download file from MinIO
+app.get('/api/download/:fileId', async (req, res) => {
   try {
     const fileId = req.params.fileId;
     const metadata = fileMetadata.get(fileId);
@@ -162,26 +223,31 @@ app.get('/api/download/:fileId', (req, res) => {
       return res.status(404).json({ error: 'File not found' });
     }
 
-    const filePath = metadata.path;
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ error: 'File not found on disk' });
-    }
+    console.log('📥 Downloading file from MinIO:', metadata.s3Key);
+
+    // Get file from MinIO
+    const getCommand = new GetObjectCommand({
+      Bucket: BUCKET_NAME,
+      Key: metadata.s3Key
+    });
+
+    const response = await s3Client.send(getCommand);
 
     // Set appropriate headers for download
     res.setHeader('Content-Disposition', `attachment; filename="${metadata.originalName}"`);
     res.setHeader('Content-Type', metadata.mimetype);
+    res.setHeader('Content-Length', metadata.size);
 
     // Stream the file
-    const fileStream = fs.createReadStream(filePath);
-    fileStream.pipe(res);
+    response.Body.pipe(res);
   } catch (error) {
-    console.error('Download error:', error);
+    console.error('❌ Download error:', error);
     res.status(500).json({ error: 'Download failed' });
   }
 });
 
-// Delete file
-app.delete('/api/files/:fileId', (req, res) => {
+// Delete file from MinIO and metadata
+app.delete('/api/files/:fileId', async (req, res) => {
   try {
     const fileId = req.params.fileId;
     const metadata = fileMetadata.get(fileId);
@@ -190,49 +256,72 @@ app.delete('/api/files/:fileId', (req, res) => {
       return res.status(404).json({ error: 'File not found' });
     }
 
-    // Delete file from disk
-    if (fs.existsSync(metadata.path)) {
-      fs.unlinkSync(metadata.path);
-    }
+    console.log('🗑️ Deleting file from MinIO:', metadata.s3Key);
 
-    // Remove from metadata
+    // Delete from MinIO
+    const deleteCommand = new DeleteObjectCommand({
+      Bucket: BUCKET_NAME,
+      Key: metadata.s3Key
+    });
+
+    await s3Client.send(deleteCommand);
+    console.log('✅ File deleted from MinIO');
+
+    // Remove from local metadata
     fileMetadata.delete(fileId);
-    saveMetadata();
+    saveMetadata(fileMetadata);
 
-    console.log(`File deleted: ${metadata.originalName}`);
+    console.log(`🗑️ File deleted: ${metadata.originalName}`);
 
     res.json({ success: true, message: 'File deleted successfully' });
   } catch (error) {
-    console.error('Delete error:', error);
+    console.error('❌ Delete error:', error);
     res.status(500).json({ error: 'Delete failed' });
   }
 });
 
 // Health check
-app.get('/api/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    message: 'File upload server is running',
-    filesCount: fileMetadata.size
-  });
+app.get('/api/health', async (req, res) => {
+  try {
+    // Test MinIO connection
+    const listCommand = new ListObjectsV2Command({
+      Bucket: BUCKET_NAME,
+      MaxKeys: 1
+    });
+    
+    await s3Client.send(listCommand);
+    
+    res.json({ 
+      status: 'ok', 
+      message: 'File upload server is running',
+      filesCount: fileMetadata.size,
+      storage: 'MinIO S3-Compatible',
+      bucket: BUCKET_NAME,
+      resumableUploads: 'TUS Protocol Enabled'
+    });
+  } catch (error) {
+    console.error('❌ Health check failed:', error);
+    res.status(500).json({ 
+      status: 'error',
+      message: 'Storage connection failed',
+      error: error.message
+    });
+  }
 });
 
 // Error handling middleware
 app.use((error, req, res, next) => {
-  if (error instanceof multer.MulterError) {
-    if (error.code === 'LIMIT_FILE_SIZE') {
-      return res.status(400).json({ error: 'File too large' });
-    }
-  }
-  console.error('Server error:', error);
+  console.error('❌ Server error:', error);
   res.status(500).json({ error: 'Internal server error' });
 });
 
-const server = app.listen(PORT, () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ File upload server running on port ${PORT}`);
-  console.log(`Uploads directory: ${uploadsDir}`);
-  console.log(`Loaded ${fileMetadata.size} existing files`);
-  console.log(`Health check: http://localhost:${PORT}/api/health`);
+  console.log(`📁 Temp uploads directory: ${tempDir}`);
+  console.log(`🪣 MinIO bucket: ${BUCKET_NAME}`);
+  console.log(`📊 Loaded ${fileMetadata.size} existing files`);
+  console.log(`🔄 Resumable uploads enabled (TUS protocol)`);
+  console.log(`🏥 Health check: http://localhost:${PORT}/api/health`);
 });
 
 // Handle server startup errors
