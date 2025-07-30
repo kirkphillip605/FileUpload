@@ -7,6 +7,10 @@ export default defineConfig({
   server: {
     port: 3010,
     host: true,
+    allowedHosts: [
+          'files.kirknetllc.com',       // Allow a specific domain
+          '.kirknetllc.com.com',
+        ],
     strictPort: true,
     proxy: {
       '/api': {
