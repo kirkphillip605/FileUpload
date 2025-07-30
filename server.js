@@ -3,10 +3,18 @@ const multer = require('multer');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
-const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 const PORT = process.env.PORT || 3011;
+
+// Generate UUID without external dependency
+const generateUUID = () => {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+    const r = Math.random() * 16 | 0;
+    const v = c == 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+};
 
 // Ensure uploads directory exists
 const uploadsDir = path.join(__dirname, 'uploads');
@@ -72,12 +80,15 @@ const saveMetadata = () => {
 
 // Upload file
 app.post('/api/upload', upload.single('file'), (req, res) => {
+  console.log('📤 Upload request received');
+  
   try {
     if (!req.file) {
+      console.log('❌ No file in request');
       return res.status(400).json({ error: 'No file uploaded' });
     }
 
-    const fileId = uuidv4();
+    const fileId = generateUUID();
     const metadata = {
       id: fileId,
       originalName: req.file.originalname,
@@ -91,7 +102,7 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
     fileMetadata.set(fileId, metadata);
     saveMetadata();
 
-    console.log(`File uploaded: ${req.file.originalname} (${req.file.size} bytes)`);
+    console.log(`✅ File uploaded: ${req.file.originalname} (${req.file.size} bytes)`);
 
     res.json({
       success: true,
@@ -103,7 +114,7 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Upload error:', error);
+    console.error('❌ Upload error:', error);
     res.status(500).json({ error: 'Upload failed' });
   }
 });
@@ -203,11 +214,11 @@ app.use((error, req, res, next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
-const server = app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, () => {
   console.log(`✅ File upload server running on port ${PORT}`);
   console.log(`Uploads directory: ${uploadsDir}`);
   console.log(`Loaded ${fileMetadata.size} existing files`);
-  console.log(`API available at: http://localhost:${PORT}/api/`);
+  console.log(`Health check: http://localhost:${PORT}/api/health`);
 });
 
 // Handle server startup errors

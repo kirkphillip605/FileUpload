@@ -44,19 +44,29 @@ export const FileUpload: React.FC<FileUploadProps> = ({ onLogout }) => {
       formData.append('file', file);
 
       // Upload to backend
-      fetch('/api/upload', {
+      const uploadUrl = import.meta.env.DEV ? '/api/upload' : '/api/upload';
+      
+      fetch(uploadUrl, {
         method: 'POST',
         body: formData,
       })
-      .then(response => response.json())
-      .then(data => {
+      .then(async response => {
+        console.log('📡 Upload response status:', response.status);
+        
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        
+        const data = await response.json();
+        console.log('📨 Upload response data:', data);
+        
         if (data.success) {
           setUploadedFiles(prev => 
             prev.map(f => 
               f.id === fileId ? { ...f, status: 'success', progress: 100 } : f
             )
           );
-          console.log('✅ File uploaded successfully:', data.file.name);
+          console.log('✅ File uploaded successfully:', data.file?.name || 'Unknown file');
           resolve();
         } else {
           throw new Error(data.error || 'Upload failed');

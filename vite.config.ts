@@ -7,21 +7,22 @@ export default defineConfig({
   server: {
     port: 3010,
     host: true,
+    strictPort: true,
     proxy: {
       '/api': {
         target: 'http://localhost:3011',
         changeOrigin: true,
         secure: false,
-        ws: true,
-        configure: (proxy, _options) => {
+        timeout: 60000,
+        configure: (proxy) => {
           proxy.on('error', (err, _req, _res) => {
-            console.log('🔴 Proxy error:', err);
+            console.error('🔴 Proxy error:', err.message);
           });
           proxy.on('proxyReq', (proxyReq, req, _res) => {
-            console.log('🔄 Proxying request:', req.method, req.url);
+            console.log('🔄 Proxying:', req.method, req.url, '→', proxyReq.path);
           });
           proxy.on('proxyRes', (proxyRes, req, _res) => {
-            console.log('✅ Proxy response:', proxyRes.statusCode, req.url);
+            console.log('✅ Proxy response:', proxyRes.statusCode, 'for', req.url);
           });
         }
       }
