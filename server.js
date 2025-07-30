@@ -15,7 +15,7 @@ import { pipeline } from 'stream/promises';
 // Constants
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const PORT = process.env.PORT || 3010;
+const PORT = process.env.PORT || 3020;
 const MAX_FILE_SIZE = 25 * 1024 * 1024 * 1024; // 25GB
 const TUS_VERSION = '1.0.0';
 const METADATA_FILE = path.join(__dirname, 'file-metadata.json');
@@ -323,12 +323,14 @@ async function cleanupTempFiles() {
   });
 
   // Start server
-  const server = app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '10.10.0.251', () => {
     console.log(`✅ Server running on port ${PORT}`);
+    console.log(`🌐 Available at: http://10.10.0.251:${PORT}`);
+    console.log(`🔗 Public URL: https://files.kirknetllc.com`);
     console.log(`📁 Uploads dir: ${UPLOADS_DIR}`);
     console.log(`📊 Loaded ${metadataStore.count()} files`);
     console.log(`🔄 Resumable uploads enabled`);
-    console.log(`🏥 Health check: http://localhost:${PORT}/api/health`);
+    console.log(`🏥 Health check: https://files.kirknetllc.com/api/health`);
   });
 
   // Handle startup errors
