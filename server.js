@@ -6,7 +6,7 @@ const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
-const PORT = 3011; // Backend runs on different port
+const PORT = process.env.PORT || 3011;
 
 // Ensure uploads directory exists
 const uploadsDir = path.join(__dirname, 'uploads');
@@ -203,8 +203,28 @@ app.use((error, req, res, next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`File upload server running on port ${PORT}`);
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log(`✅ File upload server running on port ${PORT}`);
   console.log(`Uploads directory: ${uploadsDir}`);
   console.log(`Loaded ${fileMetadata.size} existing files`);
+  console.log(`API available at: http://localhost:${PORT}/api/`);
+});
+
+// Handle server startup errors
+server.on('error', (error) => {
+  if (error.code === 'EADDRINUSE') {
+    console.error(`❌ Port ${PORT} is already in use. Please close other applications using this port.`);
+  } else {
+    console.error('❌ Server error:', error);
+  }
+  process.exit(1);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('🛑 Shutting down file upload server...');
+  server.close(() => {
+    console.log('✅ File upload server closed');
+    process.exit(0);
+  });
 });

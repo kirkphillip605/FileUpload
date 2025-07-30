@@ -56,13 +56,14 @@ export const FileUpload: React.FC<FileUploadProps> = ({ onLogout }) => {
               f.id === fileId ? { ...f, status: 'success', progress: 100 } : f
             )
           );
+          console.log('✅ File uploaded successfully:', data.file.name);
           resolve();
         } else {
           throw new Error(data.error || 'Upload failed');
         }
       })
       .catch(error => {
-        console.error('Upload error:', error);
+        console.error('❌ Upload error:', error);
         setUploadedFiles(prev => 
           prev.map(f => 
             f.id === fileId ? { ...f, status: 'error', progress: 0 } : f
