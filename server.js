@@ -1,487 +1,349 @@
+// server.js
+// Express-based file upload server with TUS resumable protocol and simple uploads
+
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import morgan from 'morgan';
 import path from 'path';
-import fs from 'fs';
+import { promises as fs } from 'fs';
 import { fileURLToPath } from 'url';
 import formidable from 'formidable';
+import { pipeline } from 'stream/promises';
 
-// ES module __dirname equivalent
+// Constants
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const PORT = process.env.PORT || 3010;
+const MAX_FILE_SIZE = 25 * 1024 * 1024 * 1024; // 25GB
+const TUS_VERSION = '1.0.0';
+const METADATA_FILE = path.join(__dirname, 'file-metadata.json');
+const UPLOADS_DIR = path.join(__dirname, 'uploads');
+const TEMP_DIR = path.join(__dirname, 'temp');
 
-const app = express();
-const PORT = process.env.PORT || 3011;
+// Ensure directories exist
+async function ensureDir(dir) {
+  try {
+    await fs.mkdir(dir, { recursive: true });
+  } catch (err) {
+    console.error(`Failed to create directory ${dir}:`, err);
+    process.exit(1);
+  }
+}
 
-// Generate UUID without external dependency
-const generateUUID = () => {
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-    const r = Math.random() * 16 | 0;
-    const v = c == 'x' ? r : (r & 0x3 | 0x8);
+// Generate a UUID (no external dependency)
+function generateUUID() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
     return v.toString(16);
   });
-};
-
-// Ensure required directories exist
-const uploadsDir = path.join(__dirname, 'uploads');
-const tempDir = path.join(__dirname, 'temp');
-
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-if (!fs.existsSync(tempDir)) {
-  fs.mkdirSync(tempDir, { recursive: true });
-}
+// Metadata store abstraction for persistent file info
+class MetadataStore {
+  constructor(filePath) {
+    this.filePath = filePath;
+    this.map = new Map();
+  }
 
-// Middleware
-app.use(cors({
-  origin: true,
-  credentials: true,
-  exposedHeaders: ['Upload-Offset', 'Location', 'Upload-Length', 'Tus-Version', 'Tus-Resumable', 'Tus-Max-Size', 'Tus-Extension', 'Upload-Metadata']
-}));
-
-app.use(express.json({ limit: '25gb' }));
-app.use(express.urlencoded({ extended: true, limit: '25gb' }));
-
-// File metadata storage
-let fileMetadata = new Map();
-
-// Load existing file metadata on startup
-const metadataFile = path.join(__dirname, 'file-metadata.json');
-
-const loadMetadata = () => {
-  if (fs.existsSync(metadataFile)) {
+  async load() {
     try {
-      const data = fs.readFileSync(metadataFile, 'utf8');
-      const metadata = JSON.parse(data);
-      const metadataMap = new Map();
-      Object.entries(metadata).forEach(([key, value]) => {
-        metadataMap.set(key, value);
-      });
-      return metadataMap;
-    } catch (error) {
-      console.error('Error loading file metadata:', error);
-      return new Map();
+      const data = await fs.readFile(this.filePath, 'utf8');
+      const obj = JSON.parse(data);
+      this.map = new Map(Object.entries(obj));
+    } catch (err) {
+      if (err.code !== 'ENOENT') console.error('Error loading metadata:', err);
     }
   }
-  return new Map();
-};
 
-const saveMetadata = (metadataMap) => {
-  try {
-    const metadata = Object.fromEntries(metadataMap);
-    fs.writeFileSync(metadataFile, JSON.stringify(metadata, null, 2));
-  } catch (error) {
-    console.error('Error saving file metadata:', error);
-  }
-};
-
-// Load metadata on startup
-fileMetadata = loadMetadata();
-
-// Upload tracking for resumable uploads
-const uploads = new Map();
-
-// Serve built React app in production
-if (process.env.NODE_ENV === 'production') {
-  const distPath = path.join(__dirname, 'dist');
-  app.use(express.static(distPath));
-  
-  // Serve index.html for all non-API routes
-  app.get('*', (req, res, next) => {
-    if (req.path.startsWith('/api/') || req.path.startsWith('/uploads/')) {
-      return next();
+  async save() {
+    try {
+      await fs.writeFile(this.filePath, JSON.stringify(Object.fromEntries(this.map), null, 2));
+    } catch (err) {
+      console.error('Error saving metadata:', err);
     }
-    res.sendFile(path.join(distPath, 'index.html'));
-  });
+  }
+
+  get(id) { return this.map.get(id); }
+  set(id, entry) { this.map.set(id, entry); }
+  delete(id) { this.map.delete(id); }
+  entries() { return Array.from(this.map.values()); }
+  count() { return this.map.size; }
 }
 
-// TUS Protocol Headers for resumable uploads
-app.options('/api/upload', (req, res) => {
-  res.setHeader('Tus-Resumable', '1.0.0');
-  res.setHeader('Tus-Version', '1.0.0');
-  res.setHeader('Tus-Max-Size', '26843545600'); // 25GB
-  res.setHeader('Tus-Extension', 'creation,expiration');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, HEAD, PATCH, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Upload-Length, Upload-Metadata, Tus-Resumable, Upload-Offset, Content-Type');
-  res.status(200).end();
-});
+const metadataStore = new MetadataStore(METADATA_FILE);
 
-// Create upload session (TUS creation)
-app.post('/api/upload', (req, res) => {
+// Cleanup old temporary files older than 24h
+async function cleanupTempFiles() {
   try {
-    const uploadLength = parseInt(req.headers['upload-length']);
-    const uploadMetadata = req.headers['upload-metadata'] || '';
-    
-    if (!uploadLength || uploadLength > 26843545600) { // 25GB limit
-      return res.status(413).json({ error: 'File too large. Maximum size is 25GB.' });
-    }
-
-    const uploadId = generateUUID();
-    const tempFilePath = path.join(tempDir, uploadId);
-    
-    // Parse metadata
-    let filename = 'unknown';
-    let filetype = 'application/octet-stream';
-    
-    if (uploadMetadata) {
-      const metadata = uploadMetadata.split(',').map(item => {
-        const [key, value] = item.trim().split(' ');
-        return { key, value: Buffer.from(value || '', 'base64').toString() };
-      });
-      
-      const filenameItem = metadata.find(m => m.key === 'filename');
-      if (filenameItem) filename = filenameItem.value;
-      
-      const filetypeItem = metadata.find(m => m.key === 'filetype');
-      if (filetypeItem) filetype = filetypeItem.value;
-    }
-
-    // Create empty temporary file
-    fs.writeFileSync(tempFilePath, '');
-
-    // Store upload session
-    uploads.set(uploadId, {
-      id: uploadId,
-      length: uploadLength,
-      offset: 0,
-      filename,
-      filetype,
-      tempPath: tempFilePath,
-      created: new Date().toISOString()
-    });
-
-    console.log(`🆕 Upload session created: ${filename} (${uploadLength} bytes)`);
-
-    res.setHeader('Tus-Resumable', '1.0.0');
-    res.setHeader('Location', `/api/upload/${uploadId}`);
-    res.status(201).end();
-  } catch (error) {
-    console.error('❌ Create upload error:', error);
-    res.status(500).json({ error: 'Failed to create upload session' });
-  }
-});
-
-// Get upload offset (TUS head)
-app.head('/api/upload/:id', (req, res) => {
-  try {
-    const uploadId = req.params.id;
-    const upload = uploads.get(uploadId);
-
-    if (!upload) {
-      return res.status(404).end();
-    }
-
-    res.setHeader('Tus-Resumable', '1.0.0');
-    res.setHeader('Upload-Offset', upload.offset.toString());
-    res.setHeader('Upload-Length', upload.length.toString());
-    res.status(200).end();
-  } catch (error) {
-    console.error('❌ Head upload error:', error);
-    res.status(500).end();
-  }
-});
-
-// Resume/continue upload (TUS patch)
-app.patch('/api/upload/:id', (req, res) => {
-  try {
-    const uploadId = req.params.id;
-    const upload = uploads.get(uploadId);
-
-    if (!upload) {
-      return res.status(404).json({ error: 'Upload session not found' });
-    }
-
-    const uploadOffset = parseInt(req.headers['upload-offset']);
-    
-    if (uploadOffset !== upload.offset) {
-      return res.status(409).json({ error: 'Offset mismatch' });
-    }
-
-    // Write chunk to temporary file
-    const writeStream = fs.createWriteStream(upload.tempPath, { 
-      flags: 'r+', 
-      start: uploadOffset 
-    });
-
-    let bytesWritten = 0;
-
-    req.on('data', (chunk) => {
-      writeStream.write(chunk);
-      bytesWritten += chunk.length;
-    });
-
-    req.on('end', async () => {
-      writeStream.end();
-      
-      // Update upload progress
-      upload.offset += bytesWritten;
-      uploads.set(uploadId, upload);
-
-      console.log(`📊 Upload progress: ${upload.filename} - ${upload.offset}/${upload.length} bytes (${Math.round((upload.offset/upload.length)*100)}%)`);
-
-      // Check if upload is complete
-      if (upload.offset >= upload.length) {
-        try {
-          // Move file to final destination
-          const finalPath = path.join(uploadsDir, `${Date.now()}-${upload.filename}`);
-          fs.renameSync(upload.tempPath, finalPath);
-
-          // Save file metadata
-          const fileId = generateUUID();
-          const fileMetadataEntry = {
-            id: fileId,
-            originalName: upload.filename,
-            fileName: path.basename(finalPath),
-            size: upload.length,
-            mimetype: upload.filetype,
-            uploadDate: new Date().toISOString(),
-            filePath: finalPath
-          };
-
-          fileMetadata.set(fileId, fileMetadataEntry);
-          saveMetadata(fileMetadata);
-
-          // Cleanup upload session
-          uploads.delete(uploadId);
-
-          console.log(`✅ Upload completed: ${upload.filename}`);
-        } catch (error) {
-          console.error('❌ Error finalizing upload:', error);
-        }
-      }
-
-      res.setHeader('Tus-Resumable', '1.0.0');
-      res.setHeader('Upload-Offset', upload.offset.toString());
-      res.status(204).end();
-    });
-
-    req.on('error', (error) => {
-      console.error('❌ Upload stream error:', error);
-      writeStream.destroy();
-      res.status(500).json({ error: 'Upload failed' });
-    });
-
-  } catch (error) {
-    console.error('❌ Patch upload error:', error);
-    res.status(500).json({ error: 'Upload failed' });
-  }
-});
-
-// Simple upload endpoint (fallback)
-app.post('/api/upload/simple', (req, res) => {
-  const form = formidable({
-    uploadDir: uploadsDir,
-    keepExtensions: true,
-    maxFileSize: 26843545600, // 25GB
-    filename: (name, ext, part) => {
-      return `${Date.now()}-${part.originalFilename}`;
-    }
-  });
-
-  form.parse(req, (err, fields, files) => {
-    if (err) {
-      console.error('❌ Simple upload error:', err);
-      return res.status(500).json({ error: 'Upload failed' });
-    }
-
-    try {
-      const file = Array.isArray(files.file) ? files.file[0] : files.file;
-      if (!file) {
-        return res.status(400).json({ error: 'No file uploaded' });
-      }
-
-      // Save file metadata
-      const fileId = generateUUID();
-      const fileMetadataEntry = {
-        id: fileId,
-        originalName: file.originalFilename || 'unknown',
-        fileName: path.basename(file.filepath),
-        size: file.size,
-        mimetype: file.mimetype || 'application/octet-stream',
-        uploadDate: new Date().toISOString(),
-        filePath: file.filepath
-      };
-
-      fileMetadata.set(fileId, fileMetadataEntry);
-      saveMetadata(fileMetadata);
-
-      console.log(`✅ Simple upload completed: ${file.originalFilename}`);
-      res.json({ success: true, fileId, filename: file.originalFilename });
-    } catch (error) {
-      console.error('❌ Error processing simple upload:', error);
-      res.status(500).json({ error: 'Failed to process upload' });
-    }
-  });
-});
-
-// Get all files
-app.get('/api/files', async (req, res) => {
-  try {
-    const files = Array.from(fileMetadata.values()).map(file => ({
-      id: file.id,
-      name: file.originalName,
-      size: file.size,
-      uploadDate: file.uploadDate,
-      type: file.mimetype,
-      path: `/api/download/${file.id}`
-    }));
-
-    console.log(`📋 Serving ${files.length} files from local storage`);
-    res.json(files);
-  } catch (error) {
-    console.error('❌ Error fetching files:', error);
-    res.status(500).json({ error: 'Failed to fetch files' });
-  }
-});
-
-// Download file from local storage
-app.get('/api/download/:fileId', async (req, res) => {
-  try {
-    const fileId = req.params.fileId;
-    const metadata = fileMetadata.get(fileId);
-
-    if (!metadata) {
-      return res.status(404).json({ error: 'File not found' });
-    }
-
-    const filePath = metadata.filePath;
-    
-    // Check if file exists on disk
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ error: 'File not found on disk' });
-    }
-
-    console.log('📥 Downloading file from local storage:', metadata.originalName);
-
-    // Get file stats
-    const stats = fs.statSync(filePath);
-
-    // Set appropriate headers for download
-    res.setHeader('Content-Disposition', `attachment; filename="${metadata.originalName}"`);
-    res.setHeader('Content-Type', metadata.mimetype);
-    res.setHeader('Content-Length', stats.size);
-
-    // Stream the file from disk
-    const fileStream = fs.createReadStream(filePath);
-    fileStream.pipe(res);
-  } catch (error) {
-    console.error('❌ Download error:', error);
-    res.status(500).json({ error: 'Download failed' });
-  }
-});
-
-// Delete file from local storage and metadata
-app.delete('/api/files/:fileId', async (req, res) => {
-  try {
-    const fileId = req.params.fileId;
-    const metadata = fileMetadata.get(fileId);
-
-    if (!metadata) {
-      return res.status(404).json({ error: 'File not found' });
-    }
-
-    const filePath = metadata.filePath;
-    
-    console.log('🗑️ Deleting file from local storage:', metadata.originalName);
-
-    // Delete from local storage
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-      console.log('✅ File deleted from local storage');
-    }
-
-    // Remove from local metadata
-    fileMetadata.delete(fileId);
-    saveMetadata(fileMetadata);
-
-    console.log(`🗑️ File deleted: ${metadata.originalName}`);
-
-    res.json({ success: true, message: 'File deleted successfully' });
-  } catch (error) {
-    console.error('❌ Delete error:', error);
-    res.status(500).json({ error: 'Delete failed' });
-  }
-});
-
-// Health check
-app.get('/api/health', async (req, res) => {
-  try {
-    // Check if uploads directory exists and is writable
-    if (!fs.existsSync(uploadsDir)) {
-      throw new Error('Uploads directory does not exist');
-    }
-    
-    res.json({ 
-      status: 'ok', 
-      message: 'File upload server is running',
-      filesCount: fileMetadata.size,
-      activeUploads: uploads.size,
-      storage: 'Local File System',
-      uploadsDirectory: uploadsDir,
-      resumableUploads: 'Custom TUS Implementation'
-    });
-  } catch (error) {
-    console.error('❌ Health check failed:', error);
-    res.status(500).json({ 
-      status: 'error',
-      message: 'Local storage check failed',
-      error: error.message
-    });
-  }
-});
-
-// Error handling middleware
-app.use((error, req, res, next) => {
-  console.error('❌ Server error:', error);
-  res.status(500).json({ error: 'Internal server error' });
-});
-
-const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`✅ File upload server running on port ${PORT}`);
-  console.log(`📁 Local uploads directory: ${uploadsDir}`);
-  console.log(`📊 Loaded ${fileMetadata.size} existing files`);
-  console.log(`🔄 Custom resumable uploads enabled`);
-  console.log(`🏥 Health check: http://localhost:${PORT}/api/health`);
-});
-
-// Handle server startup errors
-server.on('error', (error) => {
-  if (error.code === 'EADDRINUSE') {
-    console.error(`❌ Port ${PORT} is already in use. Please close other applications using this port.`);
-  } else {
-    console.error('❌ Server error:', error);
-  }
-  process.exit(1);
-});
-
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('🛑 Shutting down file upload server...');
-  server.close(() => {
-    console.log('✅ File upload server closed');
-    process.exit(0);
-  });
-});
-
-// Cleanup temporary files on startup
-const cleanupTempFiles = () => {
-  try {
-    const tempFiles = fs.readdirSync(tempDir);
-    tempFiles.forEach(file => {
-      const filePath = path.join(tempDir, file);
-      const stats = fs.statSync(filePath);
-      const ageHours = (Date.now() - stats.mtime.getTime()) / (1000 * 60 * 60);
-      
-      // Delete temp files older than 24 hours
+    const files = await fs.readdir(TEMP_DIR);
+    const now = Date.now();
+    for (const file of files) {
+      const filePath = path.join(TEMP_DIR, file);
+      const stats = await fs.stat(filePath);
+      const ageHours = (now - stats.mtimeMs) / (1000 * 60 * 60);
       if (ageHours > 24) {
-        fs.unlinkSync(filePath);
+        await fs.unlink(filePath);
         console.log(`🧹 Cleaned up old temp file: ${file}`);
       }
-    });
-  } catch (error) {
-    console.error('❌ Error cleaning temp files:', error);
+    }
+  } catch (err) {
+    console.error('Error cleaning temp files:', err);
   }
-};
+}
 
-cleanupTempFiles();
+// Startup initialization
+(async () => {
+  await Promise.all([ensureDir(UPLOADS_DIR), ensureDir(TEMP_DIR)]);
+  await metadataStore.load();
+  cleanupTempFiles();
+  setInterval(cleanupTempFiles, 60 * 60 * 1000); // Hourly cleanup
+
+  const app = express();
+
+  // Global middleware
+  app.use(cors({ origin: true, credentials: true }));
+  app.use(helmet());
+  app.use(morgan('combined'));
+  app.use(express.json({ limit: MAX_FILE_SIZE }));
+  app.use(express.urlencoded({ extended: true, limit: MAX_FILE_SIZE }));
+
+  // Rate limiting for upload endpoints
+  const uploadLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 50, message: 'Too many requests, please try again later.' });
+  app.use(['/api/upload', '/api/upload/simple'], uploadLimiter);
+
+  // Serve React app in production
+  if (process.env.NODE_ENV === 'production') {
+    const DIST = path.join(__dirname, 'dist');
+    app.use(express.static(DIST));
+    app.get('*', (req, res, next) => {
+      if (req.path.startsWith('/api/') || req.path.startsWith('/uploads/')) return next();
+      res.sendFile(path.join(DIST, 'index.html'));
+    });
+  }
+
+  // In-memory resumable uploads tracking
+  const uploads = new Map();
+
+  // TUS protocol support
+  app.options('/api/upload', (_req, res) => {
+    res.set({
+      'Tus-Resumable': TUS_VERSION,
+      'Tus-Version': TUS_VERSION,
+      'Tus-Max-Size': MAX_FILE_SIZE.toString(),
+      'Tus-Extension': 'creation,expiration',
+      'Access-Control-Allow-Methods': 'POST, HEAD, PATCH, OPTIONS',
+      'Access-Control-Allow-Headers': 'Upload-Length, Upload-Metadata, Tus-Resumable, Upload-Offset, Content-Type'
+    }).sendStatus(200);
+  });
+
+  app.post('/api/upload', async (req, res) => {
+    try {
+      const length = Number(req.headers['upload-length']);
+      if (!length || length > MAX_FILE_SIZE) return res.status(413).json({ error: 'File too large. Maximum is 25GB.' });
+
+      const rawMeta = String(req.headers['upload-metadata'] || '');
+      const meta = Object.fromEntries(rawMeta.split(',').map(part => {
+        const [key, base64] = part.trim().split(' ');
+        return [key, base64 ? Buffer.from(base64, 'base64').toString() : ''];
+      }));
+      const filename = path.basename(meta.filename || 'unknown');
+      const filetype = meta.filetype || 'application/octet-stream';
+
+      const uploadId = generateUUID();
+      const tempPath = path.join(TEMP_DIR, uploadId);
+      await fs.writeFile(tempPath, '');
+
+      uploads.set(uploadId, { id: uploadId, length, offset: 0, filename, filetype, tempPath, created: new Date().toISOString() });
+      res.set({'Tus-Resumable': TUS_VERSION, 'Location': `/api/upload/${uploadId}`}).status(201).end();
+    } catch (err) {
+      console.error('Error creating upload session:', err);
+      res.status(500).json({ error: 'Failed to create upload session' });
+    }
+  });
+
+  app.head('/api/upload/:id', (req, res) => {
+    const upload = uploads.get(req.params.id);
+    if (!upload) return res.sendStatus(404);
+    res.set({'Tus-Resumable': TUS_VERSION, 'Upload-Offset': upload.offset, 'Upload-Length': upload.length}).sendStatus(200);
+  });
+
+  app.patch('/api/upload/:id', async (req, res) => {
+    const upload = uploads.get(req.params.id);
+    if (!upload) return res.status(404).json({ error: 'Upload session not found' });
+
+    const offsetHeader = Number(req.headers['upload-offset']);
+    if (offsetHeader !== upload.offset) return res.status(409).json({ error: 'Offset mismatch' });
+
+    try {
+      const writeStream = fs.createWriteStream(upload.tempPath, { flags: 'r+', start: upload.offset });
+      await pipeline(req, writeStream);
+
+      const stats = await fs.stat(upload.tempPath);
+      upload.offset = stats.size;
+
+      if (upload.offset >= upload.length) {
+        const finalName = `${Date.now()}-${path.basename(upload.filename)}`;
+        const finalPath = path.join(UPLOADS_DIR, finalName);
+        await fs.rename(upload.tempPath, finalPath);
+
+        const fileId = generateUUID();
+        const entry = {
+          id: fileId,
+          originalName: upload.filename,
+          fileName: finalName,
+          size: upload.length,
+          mimetype: upload.filetype,
+          uploadDate: new Date().toISOString(),
+          filePath: finalPath
+        };
+        metadataStore.set(fileId, entry);
+        await metadataStore.save();
+        uploads.delete(upload.id);
+        console.log(`✅ Upload completed: ${entry.originalName}`);
+      }
+
+      res.set({'Tus-Resumable': TUS_VERSION, 'Upload-Offset': upload.offset}).sendStatus(204);
+    } catch (err) {
+      console.error('Error during upload:', err);
+      res.status(500).json({ error: 'Upload failed' });
+    }
+  });
+
+  // Fallback simple upload
+  app.post('/api/upload/simple', (req, res) => {
+    const form = formidable({
+      uploadDir: UPLOADS_DIR,
+      keepExtensions: true,
+      maxFileSize: MAX_FILE_SIZE,
+      filename: (_name, _ext, part) => `${Date.now()}-${path.basename(part.originalFilename || '')}`
+    });
+
+    form.parse(req, async (err, _fields, files) => {
+      if (err) {
+        console.error('Simple upload error:', err);
+        return res.status(500).json({ error: 'Upload failed' });
+      }
+      try {
+        const file = Array.isArray(files.file) ? files.file[0] : files.file;
+        if (!file) return res.status(400).json({ error: 'No file uploaded' });
+
+        const fileId = generateUUID();
+        const entry = {
+          id: fileId,
+          originalName: file.originalFilename || 'unknown',
+          fileName: path.basename(file.filepath),
+          size: file.size,
+          mimetype: file.mimetype || 'application/octet-stream',
+          uploadDate: new Date().toISOString(),
+          filePath: file.filepath
+        };
+        metadataStore.set(fileId, entry);
+        await metadataStore.save();
+        console.log(`✅ Simple upload completed: ${entry.originalName}`);
+        res.json({ success: true, fileId, filename: entry.originalName });
+      } catch (err) {
+        console.error('Error processing simple upload:', err);
+        res.status(500).json({ error: 'Failed to process upload' });
+      }
+    });
+  });
+
+  // List all files
+  app.get('/api/files', (req, res) => {
+    const files = metadataStore.entries().map(f => ({
+      id: f.id,
+      name: f.originalName,
+      size: f.size,
+      uploadDate: f.uploadDate,
+      type: f.mimetype,
+      path: `/api/download/${f.id}`
+    }));
+    res.json(files);
+  });
+
+  // Download a file
+  app.get('/api/download/:fileId', async (req, res) => {
+    try {
+      const metadata = metadataStore.get(req.params.fileId);
+      if (!metadata) return res.status(404).json({ error: 'File not found' });
+
+      const stat = await fs.stat(metadata.filePath);
+      res.setHeader('Content-Disposition', `attachment; filename="${metadata.originalName}"`);
+      res.setHeader('Content-Type', metadata.mimetype);
+      res.setHeader('Content-Length', stat.size);
+      await pipeline(fs.createReadStream(metadata.filePath), res);
+    } catch (err) {
+      console.error('Download error:', err);
+      res.status(500).json({ error: 'Download failed' });
+    }
+  });
+
+  // Delete a file
+  app.delete('/api/files/:fileId', async (req, res) => {
+    try {
+      const metadata = metadataStore.get(req.params.fileId);
+      if (!metadata) return res.status(404).json({ error: 'File not found' });
+
+      try { await fs.unlink(metadata.filePath); console.log(`🗑️ Deleted file: ${metadata.originalName}`); } catch {}
+
+      metadataStore.delete(metadata.id);
+      await metadataStore.save();
+      res.json({ success: true, message: 'File deleted successfully' });
+    } catch (err) {
+      console.error('Delete error:', err);
+      res.status(500).json({ error: 'Delete failed' });
+    }
+  });
+
+  // Health check
+  app.get('/api/health', async (req, res) => {
+    try {
+      await fs.access(UPLOADS_DIR);
+      res.json({
+        status: 'ok',
+        message: 'File upload server is running',
+        filesCount: metadataStore.count(),
+        activeUploads: uploads.size,
+        storage: 'Local File System',
+        resumableUploads: 'Custom TUS Implementation'
+      });
+    } catch (err) {
+      console.error('Health check failed:', err);
+      res.status(500).json({ status: 'error', message: 'Local storage check failed', error: err.message });
+    }
+  });
+
+  // Error handling middleware
+  app.use((err, req, res, next) => {
+    console.error('Server error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  });
+
+  // Start server
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`✅ Server running on port ${PORT}`);
+    console.log(`📁 Uploads dir: ${UPLOADS_DIR}`);
+    console.log(`📊 Loaded ${metadataStore.count()} files`);
+    console.log(`🔄 Resumable uploads enabled`);
+    console.log(`🏥 Health check: http://localhost:${PORT}/api/health`);
+  });
+
+  // Handle startup errors
+  server.on('error', err => {
+    if (err.code === 'EADDRINUSE') console.error(`❌ Port ${PORT} in use`);
+    else console.error('Server error:', err);
+    process.exit(1);
+  });
+
+  // Graceful shutdown
+  process.on('SIGTERM', () => {
+    console.log('🛑 Shutting down...');
+    server.close(() => {
+      console.log('✅ Closed');
+      process.exit(0);
+    });
+  });
+})();
